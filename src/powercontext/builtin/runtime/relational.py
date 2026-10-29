@@ -1363,6 +1363,7 @@ class RelationalContexts:
         /,
         *,
         processing: ScopeInvocation | None = None,
+        source_count_threshold: int | None = None,
         authorize_snapshot: MemorySnapshotAuthorizer | None = None,
         on_commit: MemoryCommitHook | None = None,
     ) -> MemoryFlushResult:
@@ -1371,7 +1372,13 @@ class RelationalContexts:
             services=services,
             lock=self._activation_locks.setdefault(services.scope_id, asyncio.Lock()),
             tracing=self._tracing,
-        ).flush(limit=limit, processing=processing, authorize_snapshot=authorize_snapshot, on_commit=on_commit)
+        ).flush(
+            limit=limit,
+            processing=processing,
+            source_count_threshold=source_count_threshold,
+            authorize_snapshot=authorize_snapshot,
+            on_commit=on_commit,
+        )
 
     async def incubate_experience(
         self,
@@ -1691,6 +1698,7 @@ class _RelationalTriggers:
         *,
         limit: int,
         processing: ScopeInvocation | None = None,
+        source_count_threshold: int | None = None,
         authorize_snapshot: MemorySnapshotAuthorizer | None = None,
         on_commit: MemoryCommitHook | None = None,
     ) -> MemoryFlushResult:
@@ -1754,6 +1762,15 @@ class _RelationalTriggers:
                         await on_commit(connection, before, updated)
                     if processing is not None:
                         await processing.complete(connection, remaining_work=action.through < high_watermark)
+                        if (
+                            source_count_threshold is not None
+                            and high_watermark - action.through >= source_count_threshold
+                        ):
+                            await processing.intents.request(
+                                connection,
+                                processing.assignment.scope_id,
+                                processing.assignment.binding_name,
+                            )
             return MemoryFlushResult(
                 previous_cursor=action.after,
                 high_watermark=high_watermark,

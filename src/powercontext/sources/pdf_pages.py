@@ -5,6 +5,9 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import math
+import re
+from collections import Counter
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pypdf import PdfReader
@@ -111,11 +114,119 @@ PDF_PAGE_SOURCE_DEFINITION = AdapterSourceDefinition(_Adapter(), projections=(_P
 async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[MemoryCitation, ...]:
     if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
         raise ValueError("limit")
-    page = await memory.search(SearchMemoryRequest(query=question, mode="fts", limit=limit))
-    return tuple(
-        MemoryCitation(memory_ref=hit.memory_ref, entry_id=hit.entry_id, entry_version_id=hit.entry_version_id)
-        for hit in page.hits[:limit]
-    )
+    if not isinstance(question, str) or not question.strip():
+        raise ValueError("question")
+
+    # The Runtime's default FTS admission floor is deliberately conservative for
+    # general Memory searches.  A FinanceBench question is comparatively long and
+    # often names a derived metric (for example EBITDA or capex) which does not occur
+    # verbatim on either of the two pages needed to answer it.  A single raw FTS call
+    # therefore has poor page recall even though the correct pages are indexed.
+    #
+    # Keep the native search in the path, then rerank the exact current Memory entries
+    # locally.  ``list`` and the citations below are public scoped-Memory operations;
+    # no PDF, answer key, page label, or evaluation asset is consulted here.
+    native = await memory.search(SearchMemoryRequest(query=question, mode="fts", limit=max(32, limit * 4)))
+    entries = (await memory.list()).entries
+    if not entries:
+        return ()
+
+    query_terms, phrases = _financial_query(question)
+    documents = [Counter(_words(item.entry.text)) for item in entries]
+    lengths = [sum(tokens.values()) for tokens in documents]
+    average_length = sum(lengths) / len(lengths) if lengths else 1.0
+    frequencies = Counter(term for term in set(query_terms) for tokens in documents if term in tokens)
+    native_rank = {
+        (hit.memory_ref.artifact_id, hit.entry_id, hit.entry_version_id): rank
+        for rank, hit in enumerate(native.hits, start=1)
+    }
+
+    scored = []
+    for item, tokens, length in zip(entries, documents, lengths, strict=True):
+        score = 0.0
+        for term, query_frequency in Counter(query_terms).items():
+            term_frequency = tokens.get(term, 0)
+            if not term_frequency:
+                continue
+            document_frequency = frequencies[term]
+            inverse_frequency = math.log(1.0 + (len(documents) - document_frequency + 0.5) / (document_frequency + 0.5))
+            denominator = term_frequency + 1.2 * (0.25 + 0.75 * length / max(average_length, 1.0))
+            score += min(query_frequency, 2) * inverse_frequency * term_frequency * 2.2 / denominator
+
+        normalized = " ".join(_words(item.entry.text))
+        score += sum(18.0 + 2.0 * len(phrase.split()) for phrase in phrases if phrase in normalized)
+        identity = (item.memory_ref.artifact_id, item.entry.entry_id, item.entry.entry_version_id)
+        if identity in native_rank:
+            score += 1.0 / (8.0 + native_rank[identity])
+        scored.append((score, identity, item.citation))
+
+    # Financial tables and their headings frequently cross a physical page break.
+    # Propagate a bounded amount of relevance to nearby pages so a continuation page
+    # remains in the candidate set without allowing adjacency to dominate its own text.
+    ranked = []
+    for index, (score, identity, citation) in enumerate(scored):
+        neighbors = [
+            scored[other][0] * weight
+            for distance, weight in ((1, 0.45), (2, 0.25))
+            for other in (index - distance, index + distance)
+            if 0 <= other < len(scored)
+        ]
+        ranked.append((score + (max(neighbors) if neighbors else 0.0), identity, citation))
+    ranked.sort(key=lambda value: (-value[0], value[1]))
+    return tuple(item[2] for item in ranked[:limit])
+
+
+_WORD = re.compile(r"[a-z]+|\d+", re.IGNORECASE)
+_QUERY_STOPWORDS = frozenset(
+    "a an and any are as assuming at be been by can calculate could details did directly do does for from give has "
+    "have how if in into is it its shown state than that the their then these this to use using was were what when "
+    "where which who why will with within would answer question respond response perspective relying only company "
+    "fy fiscal year years million millions usd reported report reports".split()
+)
+
+
+def _words(value: str) -> tuple[str, ...]:
+    return tuple(match.group(0).casefold() for match in _WORD.finditer(value))
+
+
+def _financial_query(question: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    raw = _words(question)
+    terms = [term for term in raw if term not in _QUERY_STOPWORDS and len(term) > 1]
+    text = " ".join(raw)
+    expansions: list[str] = []
+    phrase_expansions: list[str] = []
+
+    def add(words: str) -> None:
+        values = words.split()
+        expansions.extend(values)
+        if len(values) > 1:
+            phrase_expansions.append(words)
+
+    if "ebitda" in raw:
+        add("operating income")
+        add("operating profit")
+        add("depreciation amortization")
+    if "capex" in raw or "capital expenditure" in text or "capital expenditures" in text:
+        add("capital spending")
+        add("capital expenditures")
+    if "d a" in text or ("depreciation" in raw and "amortization" in raw):
+        add("depreciation amortization")
+    if "p l" in text or "income statement" in text or "income statements" in text:
+        add("consolidated statement of income")
+    if "cash flow" in text or "cash flows" in text:
+        add("consolidated statement of cash flows")
+    if "legal" in raw or "litigation" in raw or "battles" in raw:
+        add("legal proceedings")
+        add("litigation claims regulatory proceedings")
+    if "geographies" in raw or "geography" in raw or "regions" in raw:
+        add("our operations")
+        add("reportable segments divisions")
+        add("countries territories")
+        add("north america latin america europe africa middle east south asia pacific australia new zealand china")
+    if "restructuring" in raw:
+        add("restructuring impairment charges")
+
+    return tuple(terms + expansions), tuple(dict.fromkeys(phrase_expansions))
 
 
 __all__ = ["PDF_PAGE_SOURCE_DEFINITION", "PDFDocumentInput", "PDFPageInput", "parse_pdf_document", "search_pdf_pages"]

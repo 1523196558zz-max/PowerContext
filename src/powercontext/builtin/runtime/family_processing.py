@@ -207,6 +207,7 @@ async def _process_family_invocation(  # noqa: C901 - one guarded dispatch per r
                 scope,
                 config.runtime.source_window_limit,
                 processing=invocation,
+                source_count_threshold=config.runtime.memory_source_count_threshold,
                 authorize_snapshot=None if security is None else partial(security.authorize_memory, scope),
                 on_commit=None if security is None else partial(security.memory_commit, scope_id=scope),
             )
