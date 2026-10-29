@@ -132,6 +132,8 @@ async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[Memo
         return ()
 
     query_terms, phrases = _financial_query(question)
+    document_names = [item.entry.text.partition("\n")[0] for item in entries]
+    affinities = _document_affinities(document_names, question)
     documents = [Counter(_words(item.entry.text)) for item in entries]
     lengths = [sum(tokens.values()) for tokens in documents]
     average_length = sum(lengths) / len(lengths) if lengths else 1.0
@@ -142,7 +144,7 @@ async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[Memo
     }
 
     scored = []
-    for item, tokens, length in zip(entries, documents, lengths, strict=True):
+    for item, tokens, length, document in zip(entries, documents, lengths, document_names, strict=True):
         score = 0.0
         for term, query_frequency in Counter(query_terms).items():
             term_frequency = tokens.get(term, 0)
@@ -158,31 +160,111 @@ async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[Memo
         identity = (item.memory_ref.artifact_id, item.entry.entry_id, item.entry.entry_version_id)
         if identity in native_rank:
             score += 1.0 / (8.0 + native_rank[identity])
-        scored.append((score, identity, item.citation))
+        scored.append((affinities[document], score, identity, item.citation))
 
-    # Financial tables and their headings frequently cross a physical page break.
-    # Propagate a bounded amount of relevance to nearby pages so a continuation page
-    # remains in the candidate set without allowing adjacency to dominate its own text.
-    ranked = []
-    for index, (score, identity, citation) in enumerate(scored):
-        neighbors = [
-            scored[other][0] * weight
-            for distance, weight in ((1, 0.45), (2, 0.25))
-            for other in (index - distance, index + distance)
-            if 0 <= other < len(scored)
-        ]
-        ranked.append((score + (max(neighbors) if neighbors else 0.0), identity, citation))
-    ranked.sort(key=lambda value: (-value[0], value[1]))
-    return tuple(item[2] for item in ranked[:limit])
+    # The inventory is ordered by entry identity, not physical PDF page number.
+    # Never infer page adjacency from its order. Explicit report identity in the
+    # question takes precedence over repeated financial terminology in other reports.
+    scored.sort(key=lambda value: (-value[0], -value[1], value[2]))
+    return tuple(item[3] for item in scored[:limit])
+
+
+def _document_affinities(names: list[str], question: str) -> dict[str, float]:
+    query = set(_words(question))
+    ignored = {"annual", "report", "form", "inc", "corporation", "corp", "company", "limited", "ltd"}
+    identities = {}
+    for name in set(names):
+        words = set(_words(name))
+        companies = {word for word in words if word.isalpha() and len(word) > 1 and word not in ignored}
+        years = {word for word in words if len(word) == 4 and word.isdigit()}
+        identities[name] = (companies, years)
+    # If a document ID is opaque or no company is named, preserve content-based
+    # retrieval. A year by itself is not enough to infer the intended document.
+    company_matches = {name: len(company & query) / max(1, len(company)) for name, (company, _) in identities.items()}
+    if not any(company_matches.values()):
+        return dict.fromkeys(identities, 0.0)
+    return {
+        name: 2 * company_matches[name] + (bool(years & query) if company_matches[name] else 0)
+        for name, (_, years) in identities.items()
+    }
 
 
 _WORD = re.compile(r"[a-z]+|\d+", re.IGNORECASE)
-_QUERY_STOPWORDS = frozenset(
-    "a an and any are as assuming at be been by can calculate could details did directly do does for from give has "
-    "have how if in into is it its shown state than that the their then these this to use using was were what when "
-    "where which who why will with within would answer question respond response perspective relying only company "
-    "fy fiscal year years million millions usd reported report reports".split()
-)
+_QUERY_STOPWORDS = frozenset([
+    "a",
+    "an",
+    "and",
+    "any",
+    "are",
+    "as",
+    "assuming",
+    "at",
+    "be",
+    "been",
+    "by",
+    "can",
+    "calculate",
+    "could",
+    "details",
+    "did",
+    "directly",
+    "do",
+    "does",
+    "for",
+    "from",
+    "give",
+    "has",
+    "have",
+    "how",
+    "if",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "shown",
+    "state",
+    "than",
+    "that",
+    "the",
+    "their",
+    "then",
+    "these",
+    "this",
+    "to",
+    "use",
+    "using",
+    "was",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "will",
+    "with",
+    "within",
+    "would",
+    "answer",
+    "question",
+    "respond",
+    "response",
+    "perspective",
+    "relying",
+    "only",
+    "company",
+    "fy",
+    "fiscal",
+    "year",
+    "years",
+    "million",
+    "millions",
+    "usd",
+    "reported",
+    "report",
+    "reports",
+])
 
 
 def _words(value: str) -> tuple[str, ...]:
