@@ -170,13 +170,27 @@ async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[Memo
 
 
 def _document_affinities(names: list[str], question: str) -> dict[str, float]:
-    query = set(_words(question))
-    ignored = {"annual", "report", "form", "inc", "corporation", "corp", "company", "limited", "ltd"}
+    query_words = re.findall(r"[a-z0-9]+", question.casefold())
+    # A report label may join the words in a company name or retain digits.
+    # Compare contiguous query words as well as individual words (e.g. 3M or
+    # Coca-Cola versus COCACOLA), without matching substrings inside other words.
+    query = {
+        "".join(query_words[start : start + width])
+        for start in range(len(query_words))
+        for width in range(1, min(6, len(query_words) - start) + 1)
+    }
+    query_years = set(re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", question))
+    ignored = {"annual", "report", "form", "inc", "corporation", "corp", "company", "limited", "ltd", "10k", "10q"}
     identities = {}
     for name in set(names):
-        words = set(_words(name))
-        companies = {word for word in words if word.isalpha() and len(word) > 1 and word not in ignored}
-        years = {word for word in words if len(word) == 4 and word.isdigit()}
+        normalized = name.casefold()
+        years = set(re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", normalized))
+        without_dates = re.sub(r"(?:fy)?(?:19|20)\d{2}(?:q[1-4])?", " ", normalized)
+        companies = {
+            word
+            for word in re.findall(r"[a-z0-9]+", without_dates)
+            if not word.isdigit() and len(word) > 1 and word not in ignored
+        }
         identities[name] = (companies, years)
     # If a document ID is opaque or no company is named, preserve content-based
     # retrieval. A year by itself is not enough to infer the intended document.
@@ -184,7 +198,7 @@ def _document_affinities(names: list[str], question: str) -> dict[str, float]:
     if not any(company_matches.values()):
         return dict.fromkeys(identities, 0.0)
     return {
-        name: 2 * company_matches[name] + (bool(years & query) if company_matches[name] else 0)
+        name: 2 * company_matches[name] + (bool(years & query_years) if company_matches[name] else 0)
         for name, (_, years) in identities.items()
     }
 
@@ -272,7 +286,8 @@ def _words(value: str) -> tuple[str, ...]:
 
 
 def _financial_query(question: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    raw = _words(question)
+    normalized_question = re.sub(r"\bcashflows?\b", "cash flow", question, flags=re.IGNORECASE)
+    raw = _words(normalized_question)
     terms = [term for term in raw if term not in _QUERY_STOPWORDS and len(term) > 1]
     text = " ".join(raw)
     expansions: list[str] = []
@@ -297,6 +312,25 @@ def _financial_query(question: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
         add("consolidated statement of income")
     if "cash flow" in text or "cash flows" in text:
         add("consolidated statement of cash flows")
+        add("consolidated statements of cash flows")
+        add("cash flows from operating activities")
+    if "free cash" in text or "cash conversion" in text:
+        add("net cash provided by operating activities")
+        add("capital expenditures")
+        add("net income")
+    if "capital intensive" in text or "capital intensity" in text:
+        add("property plant and equipment")
+        add("capital expenditures")
+        add("purchases of property plant and equipment")
+        add("net sales")
+        add("total assets")
+    if "segment" in raw or "segments" in raw:
+        add("business segments")
+        add("segment information")
+        if "growth" in raw or "organic" in raw:
+            add("organic sales")
+            add("local currency")
+            add("acquisitions divestitures")
     if "legal" in raw or "litigation" in raw or "battles" in raw:
         add("legal proceedings")
         add("litigation claims regulatory proceedings")

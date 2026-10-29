@@ -49,13 +49,14 @@ def test_empty_password_aes_pdf(algorithm):
     assert len(pages) == 1 and pages[0].text == ""
 
 
-async def test_document_selection_and_inventory_order(tmp_path):
+@pytest.mark.parametrize(("company", "label"), [("Acme", "ACME"), ("3M", "3M"), ("Coca-Cola", "COCACOLA")])
+async def test_document_selection_and_inventory_order(tmp_path, company, label):
     registry = SourceDefinitionRegistry((PDF_PAGE_SOURCE_DEFINITION,))
     observations = []
     for document, text in (
-        ("ACME_2023_10K", "Operating income was 125 million dollars."),
+        (f"{label}_2023_10K", "Operating income was 125 million dollars."),
         ("OTHER_2023_10K", "Operating income " * 20),
-        ("ACME_2022_10K", "Operating income " * 20),
+        (f"{label}_2022_10K", "Operating income " * 20),
     ):
         for page in range(1, 26):
             source = await registry.resolve(
@@ -63,7 +64,7 @@ async def test_document_selection_and_inventory_order(tmp_path):
                     document_id=document,
                     document_sha256="a" * 64,
                     page_number=page,
-                    text=text if page == 13 or document != "ACME_2023_10K" else "General information.",
+                    text=text if page == 13 or document != f"{label}_2023_10K" else "General information.",
                 )
             )
             observations.append(project_source_for_transport(registry, source))
@@ -81,10 +82,10 @@ async def test_document_selection_and_inventory_order(tmp_path):
             pytest.fail("Page ingestion did not drain")
     async with open_builtin_runtime(config) as runtime:
         memory = runtime.memory.for_scope(scope)
-        question = "What was Acme's operating income in 2023?"
+        question = f"What was {company}'s operating income in 2023?"
         result = await search_pdf_pages(memory, question, limit=5)
         first = await memory.get(GetMemoryEntryRequest(citation=result[0]))
-        assert first.entry.text == "ACME_2023_10K\nOperating income was 125 million dollars."
+        assert first.entry.text == f"{label}_2023_10K\nOperating income was 125 million dollars."
 
         class ReorderedMemory:
             search = memory.search
