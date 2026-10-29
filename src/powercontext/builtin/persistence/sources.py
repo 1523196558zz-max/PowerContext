@@ -39,6 +39,7 @@ from powercontext.builtin.persistence.errors import (
     StoredPayloadConflictError,
 )
 from powercontext.builtin.persistence.processing_intents import ArtifactProcessingIntentRepository
+from powercontext.builtin.persistence.cursors import SourceCursorRepository
 from powercontext.builtin.persistence.tables import SOURCE_JOURNAL_HEADS_TABLE, SOURCES_TABLE
 from powercontext.builtin.sources.content import ContentSource
 from powercontext.builtin.triggers import SOURCE_WINDOW_TRIGGER_NAME
@@ -79,12 +80,15 @@ class SourceRepository:
         self,
         definitions: SourceDefinitionRegistry | Iterable[_AnySourceAdapter],
         /,
+        *,
+        source_count_thresholds: Mapping[str, int | None] | None = None,
     ) -> None:
         self._registry = (
             definitions
             if isinstance(definitions, SourceDefinitionRegistry)
             else SourceDefinitionRegistry.from_adapters(definitions)
         )
+        self._source_count_thresholds = dict(source_count_thresholds or {})
 
     async def add(
         self,
@@ -170,7 +174,14 @@ class SourceRepository:
         # a binding again. Disabled processors simply retain ordinary dirty.
         intents = ArtifactProcessingIntentRepository()
         for binding_name in SOURCE_PROCESSING_BINDINGS:
-            await intents.mark_dirty(connection, scope_id, binding_name)
+            intent = await intents.mark_dirty(connection, scope_id, binding_name)
+            threshold = self._source_count_thresholds.get(binding_name)
+            if threshold is None or intent.requested_generation > intent.handled_generation:
+                continue
+            cursor = await SourceCursorRepository().load(connection, scope_id, binding_name)
+            consumed = 0 if cursor is None else cursor.cursor.sequence
+            if position - consumed >= threshold:
+                await intents.request(connection, scope_id, binding_name)
         return StoredSource(ref=ref, value=source, journal_position=position), True
 
     async def get(
