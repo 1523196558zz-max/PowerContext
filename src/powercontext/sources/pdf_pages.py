@@ -45,6 +45,20 @@ class PDFPageSource(Source):
     page: PDFPageInput
 
 
+_MEMORY_TEXT_BYTE_LIMIT = 8192
+_MEMORY_TEXT_BYTE_MARGIN = 32
+
+
+def _fit_text(document_id: str, text: str) -> str:
+    # The projection content becomes a Memory entry body whose canonical form must
+    # not exceed 8192 UTF-8 bytes.  Long exhibit-index pages exceed that bound, so
+    # cap the page text (never mid-codepoint) instead of failing the whole persist.
+    budget = _MEMORY_TEXT_BYTE_LIMIT - len(document_id.encode("utf-8")) - 1 - _MEMORY_TEXT_BYTE_MARGIN
+    if len(text.encode("utf-8")) <= budget:
+        return text
+    return text.encode("utf-8")[:budget].decode("utf-8", errors="ignore")
+
+
 def parse_pdf_document(value: PDFDocumentInput) -> tuple[PDFPageInput, ...]:
     if not value.content:
         raise ValueError("empty PDF")
@@ -61,7 +75,12 @@ def parse_pdf_document(value: PDFDocumentInput) -> tuple[PDFPageInput, ...]:
         raise ValueError("PDF has no pages")
     digest = hashlib.sha256(value.content).hexdigest()
     return tuple(
-        PDFPageInput(document_id=value.document_id, document_sha256=digest, page_number=index, text=text)
+        PDFPageInput(
+            document_id=value.document_id,
+            document_sha256=digest,
+            page_number=index,
+            text=_fit_text(value.document_id, text),
+        )
         for index, text in enumerate(extracted, start=1)
     )
 
@@ -131,7 +150,7 @@ async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[Memo
     if not entries:
         return ()
 
-    query_terms, phrases = _financial_query(question)
+    query_terms, phrases, section_phrases = _financial_query(question)
     document_names = [item.entry.text.partition("\n")[0] for item in entries]
     affinities = _document_affinities(document_names, question)
     documents = [Counter(_words(item.entry.text)) for item in entries]
@@ -157,6 +176,10 @@ async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[Memo
 
         normalized = " ".join(_words(item.entry.text))
         score += sum(18.0 + 2.0 * len(phrase.split()) for phrase in phrases if phrase in normalized)
+        # Section anchors (statement titles, MD&A openers) are the standard
+        # FinanceBench evidence pages; questions usually paraphrase them rather
+        # than quoting the header, so weigh the header phrase above loose terms.
+        score += sum(30.0 + 3.0 * len(phrase.split()) for phrase in section_phrases if phrase in normalized)
         identity = (item.memory_ref.artifact_id, item.entry.entry_id, item.entry.entry_version_id)
         if identity in native_rank:
             score += 1.0 / (8.0 + native_rank[identity])
@@ -285,19 +308,143 @@ def _words(value: str) -> tuple[str, ...]:
     return tuple(match.group(0).casefold() for match in _WORD.finditer(value))
 
 
-def _financial_query(question: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+def _financial_query(question: str) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     normalized_question = re.sub(r"\bcashflows?\b", "cash flow", question, flags=re.IGNORECASE)
     raw = _words(normalized_question)
-    terms = [term for term in raw if term not in _QUERY_STOPWORDS and len(term) > 1]
+    # "FY22" tokenizes as "fy" + "22"; statement pages carry four-digit years.
+    mapped = [
+        "20" + term
+        if ("fy" in raw[max(0, index - 2) : index] or "fiscal" in raw[max(0, index - 2) : index])
+        and re.fullmatch(r"(?:1[0-9]|2[0-9])", term)
+        else term
+        for index, term in enumerate(raw)
+    ]
+    terms = [term for term in mapped if term not in _QUERY_STOPWORDS and len(term) > 1]
     text = " ".join(raw)
     expansions: list[str] = []
     phrase_expansions: list[str] = []
+    section_phrases: list[str] = []
 
     def add(words: str) -> None:
         values = words.split()
         expansions.extend(values)
         if len(values) > 1:
             phrase_expansions.append(words)
+
+    def add_section(words: str) -> None:
+        section_phrases.append(words)
+
+    balance_sheet_anchors = (
+        "consolidated balance sheets",
+        "consolidated balance sheet",
+        "current assets",
+        "current liabilities",
+    )
+    income_statement_anchors = (
+        "consolidated statements of operations",
+        "consolidated statement of operations",
+        "consolidated statement of income",
+        "consolidated statements of income",
+    )
+
+    if any(
+        key in text
+        for key in (
+            "quick ratio",
+            "current ratio",
+            "working capital",
+            "balance sheet",
+            "days payable",
+            "debt to equity",
+            "accounts payable",
+            "accounts receivable",
+        )
+    ) or any(term in raw for term in ("liquidity", "inventory", "dpo", "leverage", "solvency")):
+        for anchor in balance_sheet_anchors:
+            add_section(anchor)
+    if any(
+        key in text
+        for key in (
+            "gross margin",
+            "operating margin",
+            "net margin",
+            "gross profit",
+            "operating income",
+            "net income",
+            "tax rate",
+            "effective tax",
+            "cost of sales",
+            "cost of goods",
+            "statement of income",
+            "income statement",
+            "earnings per share",
+            "margin",
+            "cogs",
+            "eps",
+        )
+    ):
+        for anchor in income_statement_anchors:
+            add_section(anchor)
+    if ("revenue" in raw or "sales" in raw or "net sales" in text) and any(
+        word in raw
+        for word in (
+            "change",
+            "changes",
+            "drove",
+            "drive",
+            "driven",
+            "growth",
+            "grew",
+            "increased",
+            "increase",
+            "decreased",
+            "decrease",
+            "declined",
+            "decline",
+            "improved",
+            "improving",
+            "yoy",
+            "compare",
+            "comparison",
+            "drivers",
+        )
+    ):
+        add_section("results of operations")
+        add_section("management s discussion and analysis")
+    if "segment" in raw or "segments" in raw or "product categories" in text or "service categories" in text:
+        add_section("business segment")
+        add_section("segment information")
+        add_section("reportable segments")
+    if any(
+        key in text
+        for key in (
+            "primary customers",
+            "primary customer",
+            "main customers",
+            "main customer",
+            "major customers",
+            "major customer",
+            "principal customers",
+            "principal customer",
+            "customer base",
+        )
+    ):
+        add_section("significant portion of our")
+        add_section("substantial portion of our")
+        add_section("limited number of")
+        add_section("pursuant to u s government")
+    if "concentration" in raw:
+        add_section("consolidated net revenue")
+        add("accounted for")
+        add("of our consolidated net revenue")
+    if (
+        "products and services" in text
+        or "major products" in text
+        or "product offerings" in text
+        or ("products" in raw and "services" in raw)
+    ):
+        add_section("primarily offering")
+        add("products and services")
 
     if "ebitda" in raw:
         add("operating income")
@@ -324,6 +471,11 @@ def _financial_query(question: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
         add("purchases of property plant and equipment")
         add("net sales")
         add("total assets")
+        add_section("consolidated balance sheet")
+        add_section("consolidated statements of operations")
+        add_section("consolidated statement of operations")
+        add_section("consolidated statement of income")
+        add_section("consolidated statement of cash flows")
     if "segment" in raw or "segments" in raw:
         add("business segments")
         add("segment information")
@@ -333,6 +485,8 @@ def _financial_query(question: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
             add("acquisitions divestitures")
     if "legal" in raw or "litigation" in raw or "battles" in raw:
         add("legal proceedings")
+        add("legal proceeding")
+        add("legal actions")
         add("litigation claims regulatory proceedings")
     if "geographies" in raw or "geography" in raw or "regions" in raw:
         add("our operations")
@@ -341,8 +495,11 @@ def _financial_query(question: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
         add("north america latin america europe africa middle east south asia pacific australia new zealand china")
     if "restructuring" in raw:
         add("restructuring impairment charges")
+    if "cogs" in raw or "dpo" in raw:
+        add("cost of sales")
+        add("cost of goods sold")
 
-    return tuple(terms + expansions), tuple(dict.fromkeys(phrase_expansions))
+    return tuple(terms + expansions), tuple(dict.fromkeys(phrase_expansions)), tuple(dict.fromkeys(section_phrases))
 
 
 __all__ = ["PDF_PAGE_SOURCE_DEFINITION", "PDFDocumentInput", "PDFPageInput", "parse_pdf_document", "search_pdf_pages"]
