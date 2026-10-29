@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
@@ -106,6 +108,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[PreparedContextFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -115,6 +118,22 @@ class MemoryEntryAddress:
     memory: ArtifactAddress
     entry_id: str
     entry_version_id: str
+
+
+@dataclass(frozen=True)
+class PreparedContextFragment:
+    """One exact literal span selected from an immutable Memory entry version."""
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
+
+
+@dataclass(frozen=True)
+class _FragmentCandidate:
+    fragment: PreparedContextFragment
+    score: float
 
 
 PreparedContextOrigin = MemoryCitation | ArtifactRef | MemoryEntryAddress | ArtifactAddress
@@ -235,6 +254,9 @@ class PreparedContextBuilder:
         if sum(len(candidates.hits) for candidates in experience_candidates) > self.experience_candidate_limit:
             raise PreparedContextInvariantError("experience-candidate-limit")
 
+        if request.evidence_selection:
+            return self._select_evidence_fragments(request, memory_candidates)
+
         content, origins, omissions = self._select_entries(
             request=request,
             current_scope_id=current_scope_id,
@@ -254,6 +276,109 @@ class PreparedContextBuilder:
             context=PreparedContext(status="ready", content=content, content_bytes=content_bytes),
             origins=origins,
             omissions=omissions,
+        )
+
+    def _select_evidence_fragments(
+        self,
+        request: PrepareContextRequest,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> PreparedContextBuild:
+        """Select query-relevant literal spans while measuring the complete wire envelope."""
+
+        query_terms = _selection_terms(request.query)
+        candidates: list[_FragmentCandidate] = []
+        seen_entries: set[tuple[str, str, int, str, str]] = set()
+        total_hits = sum(len(group.hits) for group in memory_candidates)
+        hit_rank = 0
+        for group in memory_candidates:
+            if group.hits and group.memory_ref is None:
+                raise PreparedContextInvariantError("memory-ref-missing")
+            for hit in group.hits:
+                hit_rank += 1
+                if hit.memory_ref != group.memory_ref:
+                    raise PreparedContextInvariantError("memory-ref-mismatch")
+                identity = (
+                    group.scope_id,
+                    hit.memory_ref.artifact_id,
+                    hit.memory_ref.revision,
+                    hit.entry_id,
+                    hit.entry_version_id,
+                )
+                if identity in seen_entries or not hit.text.strip():
+                    continue
+                seen_entries.add(identity)
+                address = MemoryEntryAddress(
+                    memory=ArtifactAddress(scope_id=group.scope_id, artifact=hit.memory_ref),
+                    entry_id=hit.entry_id,
+                    entry_version_id=hit.entry_version_id,
+                )
+                spans = _sentence_spans(hit.text)
+                if not spans:
+                    continue
+                document_frequency = {
+                    term: sum(term in _selection_terms(hit.text[start:end]) for start, end in spans)
+                    for term in query_terms
+                }
+                # Single sentences and short adjacent windows cover both one- and multi-sentence
+                # evidence without ever manufacturing text that is absent from the entry.
+                for width in (1, 2, 3):
+                    for index in range(0, len(spans) - width + 1):
+                        start = spans[index][0]
+                        end = spans[index + width - 1][1]
+                        text = hit.text[start:end]
+                        terms = _selection_terms(text)
+                        overlap = query_terms & terms
+                        weighted_overlap = sum(
+                            math.log((len(spans) + 1) / (document_frequency[term] + 1)) + 1.0
+                            for term in overlap
+                        )
+                        coverage = len(overlap) / max(1, len(query_terms))
+                        density = len(overlap) / max(1, len(terms))
+                        phrase_bonus = 1.5 if request.query.casefold() in text.casefold() else 0.0
+                        window_bonus = 0.18 * (width - 1)
+                        rank_bonus = (total_hits - hit_rank + 1) * 0.001
+                        score = coverage * 10.0 + weighted_overlap + density + phrase_bonus + window_bonus + rank_bonus
+                        candidates.append(
+                            _FragmentCandidate(
+                                fragment=PreparedContextFragment(
+                                    address=address,
+                                    start=start,
+                                    end=end,
+                                    text=text,
+                                ),
+                                score=score,
+                            )
+                        )
+
+        ordered = sorted(
+            candidates,
+            key=lambda candidate: (
+                -candidate.score,
+                candidate.fragment.end - candidate.fragment.start,
+                candidate.fragment.address.memory.scope_id,
+                candidate.fragment.address.entry_id,
+                candidate.fragment.start,
+            ),
+        )
+        selected: list[PreparedContextFragment] = []
+        for candidate in ordered:
+            fragment = candidate.fragment
+            if any(_fragments_overlap(fragment, existing) for existing in selected):
+                continue
+            trial = (*selected, fragment)
+            if len(_render_fragments(trial).encode("utf-8")) <= request.max_bytes:
+                selected.append(fragment)
+            if len(selected) >= self.entry_limit:
+                break
+
+        if not selected:
+            return PreparedContextBuild(context=self.empty(), origins=(), fragments=())
+        content = _render_fragments(selected)
+        origins = tuple(fragment.address for fragment in selected)
+        return PreparedContextBuild(
+            context=PreparedContext(status="ready", content=content, content_bytes=len(content.encode("utf-8"))),
+            origins=origins,
+            fragments=tuple(selected),
         )
 
     def probe_budget(
@@ -722,6 +847,90 @@ def _render_entry(entry: _PreparedContextEntry) -> dict[str, object]:
 
 def _rendered_bytes(entries: Sequence[_PreparedContextEntry]) -> int:
     return len(_render(entries).encode("utf-8"))
+
+
+_SELECTION_STOP_WORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "been",
+    "by",
+    "for",
+    "from",
+    "in",
+    "into",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "their",
+    "this",
+    "to",
+    "was",
+    "were",
+    "with",
+}
+
+
+def _selection_terms(text: str) -> set[str]:
+    terms: set[str] = set()
+    for token in re.findall(r"[^\W_]+", text.casefold(), flags=re.UNICODE):
+        if token in _SELECTION_STOP_WORDS:
+            continue
+        if token.isascii():
+            for suffix in ("ingly", "edly", "ation", "ments", "ment", "ing", "ied", "ed", "es", "s"):
+                if token.endswith(suffix) and len(token) - len(suffix) >= 3:
+                    token = token[: -len(suffix)] + ("y" if suffix == "ied" else "")
+                    break
+        terms.add(token)
+    return terms
+
+
+def _sentence_spans(text: str) -> tuple[tuple[int, int], ...]:
+    spans = tuple((match.start(), match.end()) for match in re.finditer(r"\S.*?(?:[.!?]+(?=\s|$)|\Z)", text, re.DOTALL))
+    if spans:
+        return spans
+    stripped = text.strip()
+    if not stripped:
+        return ()
+    start = text.index(stripped)
+    return ((start, start + len(stripped)),)
+
+
+def _fragments_overlap(left: PreparedContextFragment, right: PreparedContextFragment) -> bool:
+    return (
+        left.address == right.address
+        and left.start < right.end
+        and right.start < left.end
+    )
+
+
+def _render_fragments(fragments: Sequence[PreparedContextFragment]) -> str:
+    items = []
+    for fragment in fragments:
+        items.append(
+            {
+                "citation": {
+                    "scope_id": fragment.address.memory.scope_id,
+                    "memory_ref": fragment.address.memory.artifact.model_dump(mode="json"),
+                    "entry_id": fragment.address.entry_id,
+                    "entry_version_id": fragment.address.entry_version_id,
+                },
+                "content": fragment.text,
+                "start": fragment.start,
+                "end": fragment.end,
+            }
+        )
+    envelope = {"trust": "untrusted_history", "items": items}
+    encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
 
 
 def _truncate_utf8(text: str, byte_budget: int) -> str:
